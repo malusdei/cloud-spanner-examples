@@ -193,6 +193,29 @@ def account_balance(database, account_number):
     print("ACCOUNT BALANCE", balance)
     return balance
 
+# Please note that Database().execute_sql Database.read has been temporarily
+# deprecated.  We will try to bring these back, as we did offer to allow for
+# execution SQL DDL syntax in our public documentation.
+# In the meantime, I would offer the following, which uses the Snapshot().read
+# method, which is still buggy, but at least does not call upon missing member
+# functions from the library...
+
+"""
+def account_balance(database, account_number):
+    params = {'account': account_number}
+    param_types = {'account': type_pb2.Type(code=type_pb2.INT64)}
+    # Added in place of execute_sql()
+    keyset = spanner.KeySet(all_=True)
+    with database.snapshot() as snapshot:
+        result = snapshot.read(
+            table='Accounts', columns=['Balance',],
+            keyset=spanner.KeySet([account_number]))
+    # Only expecting one row to come back, but return will ensure
+    # function finishes on first iteration.  Add code later to check if 
+    # more than the expected row is returned.
+        for row in result.rows:
+            return row[0]
+"""
 
 def customer_balance(database, customer_number):
     """Note: We could implement this method in terms of account_balance,
