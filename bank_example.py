@@ -1,6 +1,3 @@
-"""
-Example of a bank schema and a few interesting transactions.
-"""
 #!/usr/bin/env python2.7
 
 import datetime
@@ -12,14 +9,11 @@ from google.cloud.proto.spanner.v1 import type_pb2
 """
 This files assumes a schema:
 # NOTE THAT COMMENTS '#' MUST BE REMOVED
-
 CREATE TABLE Customers (
  CustomerNumber INT64 NOT NULL,
  LastName STRING(MAX),
  FirstName STRING(MAX),
 ) PRIMARY KEY (CustomerNumber);
-
-
 # Note that 'Balance' is a performance optimization in some ways,
 # as it could be reconstructed from AccountHistory
 CREATE TABLE Accounts (
@@ -32,12 +26,8 @@ CREATE TABLE Accounts (
  LastInterestCalculation TIMESTAMP
 ) PRIMARY KEY (CustomerNumber, AccountNumber),
   INTERLEAVE IN PARENT Customers;
-
-
 # enforce that all account numbers are unique
 CREATE UNIQUE INDEX UniqueAccountNumbers on Accounts(AccountNumber);
-
-
 # Bank Transaction history for each account.
 # Note: a viable alternative would be to interleave this table in Accounts
 # Note that we store ts DESC as primary key because this makes
@@ -48,8 +38,6 @@ CREATE TABLE AccountHistory (
   Memo STRING(MAX),
   ChangeAmount INT64 NOT NULL  # cents; positive=credit, negative=debit
 )  PRIMARY KEY (AccountNumber, ts DESC);
-
-
 # A "sharded counter" for tracking balance across all accounts.
 # (This is faster than scanning entire accounts table, if Accounts is large)
 # Only used for Lab 3, Exercise 2
@@ -118,7 +106,6 @@ def clear_tables(database):
 
 def setup_customers(database):
     """Inserts sample data into the given database.
-
     The database and table must already exist and can be created using
     `create_database`.
     """
@@ -185,49 +172,32 @@ def extract_single_cell(results):
 def account_balance(database, account_number):
     params = {'account': account_number}
     param_types = {'account': type_pb2.Type(code=type_pb2.INT64)}
-    results = database.execute_sql(
+    
+    with database.snapshot() as snapshot:
+        results=snapshot.execute_sql(
         """SELECT Balance From Accounts@{FORCE_INDEX=UniqueAccountNumbers}
            WHERE AccountNumber=@account""",
-        params=params, param_types=param_types)
+            params=params, 
+            param_types=param_types
+            )
+
     balance = extract_single_cell(results)
     print("ACCOUNT BALANCE", balance)
     return balance
 
-# Please note that Database().execute_sql Database.read has been temporarily
-# deprecated.  We will try to bring these back, as we did offer to allow for
-# execution SQL DDL syntax in our public documentation.
-# In the meantime, I would offer the following, which uses the Snapshot().read
-# method, which is still buggy, but at least does not call upon missing member
-# functions from the library...
-
-"""
-def account_balance(database, account_number):
-    params = {'account': account_number}
-    param_types = {'account': type_pb2.Type(code=type_pb2.INT64)}
-    # Added in place of execute_sql()
-    keyset = spanner.KeySet(all_=True)
-    with database.snapshot() as snapshot:
-        result = snapshot.read(
-            table='Accounts', columns=['Balance',],
-            keyset=spanner.KeySet([account_number]))
-    # Only expecting one row to come back, but return will ensure
-    # function finishes on first iteration.  Add code later to check if 
-    # more than the expected row is returned.
-        for row in result.rows:
-            return row[0]
-"""
 
 def customer_balance(database, customer_number):
     """Note: We could implement this method in terms of account_balance,
     but we explicitly want to demonstrate using JOIN"""
     params = {'customer': customer_number}
     param_types = {'customer': type_pb2.Type(code=type_pb2.INT64)}
-    results = database.execute_sql(
-        """SELECT SUM(Accounts.Balance) From Accounts INNER JOIN Customers
-           ON Accounts.CustomerNumber=Customers.CustomerNumber
-           WHERE Customers.CustomerNumber=@customer""",
-        params=params, param_types=param_types)
-    balance = extract_single_cell(results)
+    with database.snapshot() as snapshot:
+        results = snapshot.execute_sql(
+            """SELECT SUM(Accounts.Balance) From Accounts INNER JOIN Customers
+               ON Accounts.CustomerNumber=Customers.CustomerNumber
+               WHERE Customers.CustomerNumber=@customer""",
+            params=params, param_types=param_types)
+        balance = extract_single_cell(results)
     print("CUSTOMER BALANCE", balance)
     return balance
 
@@ -241,11 +211,12 @@ def last_n_transactions(database, account_number, n):
         'account': type_pb2.Type(code=type_pb2.INT64),
         'num': type_pb2.Type(code=type_pb2.INT64),
     }
-    results = database.execute_sql(
-        """SELECT Ts, ChangeAmount, Memo FROM AccountHistory
-           WHERE AccountNumber=@account ORDER BY Ts DESC LIMIT @num""",
-        params=params, param_types=param_types)
-    ret = list(results)
+    with database.snapshot() as snapshot:
+        results = snapshot.execute_sql(
+            """SELECT Ts, ChangeAmount, Memo FROM AccountHistory
+               WHERE AccountNumber=@account ORDER BY Ts DESC LIMIT @num""",
+            params=params, param_types=param_types)
+        ret = list(results)
     print("RESULTS", ret)
     pprint.pprint(ret)
     return ret
@@ -342,17 +313,18 @@ def compute_interest_for_all(database):
         # Find any account that hasn't been updated for the current month
         # (This is done in a read-only transaction, and hence does not
         # take locks on the table)
-        results = database.execute_sql(
-            """
-    SELECT CustomerNumber,AccountNumber,LastInterestCalculation FROM Accounts
-    WHERE LastInterestCalculation IS NULL OR
-    (EXTRACT(MONTH FROM LastInterestCalculation) <>
-       EXTRACT(MONTH FROM CURRENT_TIMESTAMP()) AND
-     EXTRACT(YEAR FROM LastInterestCalculation) <>
-       EXTRACT(YEAR FROM CURRENT_TIMESTAMP()))
-    LIMIT @batch_size""",
-            params={'batch_size': batch_size},
-            param_types={'customer': type_pb2.Type(code=type_pb2.INT64)})
+        with database.snapshot() as snapshot:
+            results = snapshot.execute_sql(
+                """
+            SELECT CustomerNumber,AccountNumber,LastInterestCalculation FROM Accounts
+            WHERE LastInterestCalculation IS NULL OR
+            (EXTRACT(MONTH FROM LastInterestCalculation) <>
+            EXTRACT(MONTH FROM CURRENT_TIMESTAMP()) AND
+            EXTRACT(YEAR FROM LastInterestCalculation) <>
+            EXTRACT(YEAR FROM CURRENT_TIMESTAMP()))
+            LIMIT @batch_size""",
+                params={'batch_size': batch_size},
+                param_types={'customer': type_pb2.Type(code=type_pb2.INT64)})
         zero_results = True
         for customer_number, account_number, last_calculation in results:
             zero_results = False
@@ -369,10 +341,12 @@ def compute_interest_for_all(database):
 
 def verify_consistent_balances(database):
     if AGGREGATE_BALANCE_SHARDS > 0:
-        balance_slow = extract_single_cell(
-            database.execute_sql("SELECT SUM(Balance) FROM Accounts"))
-        balance_fast = extract_single_cell(
-            database.execute_sql("SELECT SUM(Balance) FROM AggregateBalance"))
+        with database.snapshot() as snapshot:
+            balance_slow = extract_single_cell(
+                snapshot.execute_sql("SELECT SUM(Balance) FROM Accounts"))
+        with database.snapshot() as snapshot:
+            balance_fast = extract_single_cell(
+                snapshot.execute_sql("SELECT SUM(Balance) FROM AggregateBalance"))
         print("verifying that balances match: ", balance_slow, balance_fast)
         assert balance_fast == balance_slow
 
@@ -380,9 +354,9 @@ def verify_consistent_balances(database):
 def total_bank_balance(database):
     if AGGREGATE_BALANCE_SHARDS <= 0:
         raise Unsupported("There is no fast way to compute aggregate balance")
-    results = database.execute_sql(
-        """SELECT SUM(Balance) From AggregateBalance""")
-    balance = extract_single_cell(results)
+    with database.snapshot() as snapshot:
+        results = snapshot.execute_sql("""SELECT SUM(Balance) From AggregateBalance""")
+        balance = extract_single_cell(results)
     print("TOTAL BANK BALANCE", balance)
     return balance
 
@@ -404,7 +378,9 @@ def main():
     database = instance.database(database_id)
 
     setup_customers(database)
+    print ("Printing Account Balance")
     account_balance(database, ACCOUNTS[1])
+
     customer_balance(database, CUSTOMERS[0])
     deposit(database, CUSTOMERS[0], ACCOUNTS[0], 150, 'Dollar Fifty Deposit')
 
@@ -428,3 +404,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+  
